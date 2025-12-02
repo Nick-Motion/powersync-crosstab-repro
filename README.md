@@ -2,81 +2,47 @@
 
 This demonstrates data inconsistency issues when using TanStack DB's PowerSync collection across multiple browser tabs.
 
-## The Problems
+## Observed Behavior
 
-There are **two distinct issues** causing cross-tab sync failures:
-
-### Issue 1: Random Tracking Table Names (TanStack DB)
-
-TanStack DB's `powerSyncCollectionOptions` creates a **random tracking table name** for each collection instance:
-
-```javascript
-// From @tanstack/powersync-db-collection/dist/esm/powersync.js:39-41
-const trackedTableName = `__${viewName}_tracking_${Math.floor(
-  Math.random() * 4294967295
-).toString(16).padStart(8, '0')}`;
-```
-
-Each tab gets its own random tracking table (e.g., `__items_tracking_abc123` vs `__items_tracking_xyz789`).
-
-When data changes:
-1. PowerSync broadcasts `tablesUpdated` with `tables: ['items']`
-2. TanStack collection listens for its own tracking table: `tables: ['__items_tracking_xyz789']`
-3. **No match = collection doesn't see the update**
-
-### Issue 2: One-Directional Sync (PowerSync SharedWorker)
-
-PowerSync's `SharedSyncImplementation` always uses the **last connected tab** for CRUD uploads:
-
-```javascript
-// From @powersync/web/src/worker/sync/SharedSyncImplementation.ts:439-452
-uploadCrud: async () => {
-  const lastPort = this.ports[this.ports.length - 1];  // Always the newest tab!
-  // ...
-  resolve(await lastPort.clientProvider.uploadCrud());
-}
-```
-
-This means:
-- Tab A opens first → `ports[0]`
-- Tab B opens second → `ports[1]`
-- ALL uploads go through Tab B's connector, regardless of which tab made the mutation
-- If Tab B closes, sync breaks until reconnection
+- Each tab only sees its own changes
+- Cross-tab updates never appear in TanStack collections
+- SQLite has all the data (verified via direct query)
 
 ## To Reproduce
 
 1. `yarn dev`
-2. Open Tab A first
-3. Open Tab B second
-4. In Tab A, click "Add Item"
-5. Observe: Item may appear in Tab B but NOT in Tab A's TanStack collection
-6. Close Tab B
-7. Try adding items in Tab A - sync may fail
+2. Open two tabs
+3. Add an item in Tab A → Tab A sees it, Tab B doesn't
+4. Add an item in Tab B → Tab B sees it, Tab A doesn't
+5. Click "Query SQLite" in any tab → All items are there
+6. Refresh any tab → All items appear (data was in SQLite all along)
 
-## Expected Behavior
+## Root Cause
 
-Both tabs should show the same data in real-time, regardless of which tab made the mutation or which tab opened first.
+### TanStack DB uses TEMP triggers + BroadcastChannel table name mismatch
 
-## Root Causes
+Each tab creates a randomly-named tracking table and TEMP trigger:
 
-### TanStack DB Collection (`@tanstack/powersync-db-collection`)
-- Creates SQLite triggers that write to a randomly-named temp table
-- Listens only to that temp table via `onChangeWithCallback({ tables: [trackedTableName] })`
-- PowerSync broadcasts actual table names, TanStack listens for random names → **mismatch**
+```javascript
+// @tanstack/powersync-db-collection/src/powersync.ts:275-280
+const trackedTableName = `__${viewName}_tracking_${Math.floor(
+  Math.random() * 0xffffffff
+).toString(16).padStart(8, '0')}`;
+```
 
-### PowerSync SharedWorker (`@powersync/web`)
-- Uses `this.ports[this.ports.length - 1]` for credentials and uploads
-- Tab order determines which connector handles sync
-- Creates asymmetric sync behavior between tabs
+The collection then listens for changes to this tracking table:
+
+```javascript
+// Line ~360
+onChangeWithCallback({ tables: [trackedTableName] })
+```
+
+But when PowerSync's BroadcastChannel notifies tabs of changes, it sends the **actual table name** (`items`), not the random tracking table names.
+
+**Source code**: https://github.com/TanStack/db/blob/main/packages/powersync-db-collection/src/powersync.ts#L275-L280
 
 ## Potential Fixes
 
-### For TanStack DB:
-1. **Listen to the source table** (`items`) for cross-tab updates, not just the tracking table
-2. **Use a deterministic tracking table name** so all tabs share the same trigger destination
-3. **Implement BroadcastChannel** to explicitly notify collections across tabs
-
-### For PowerSync:
-1. **Round-robin or primary election** for upload handling
-2. **Route uploads through the originating tab's connector**
-3. **Fallback mechanism** when the primary tab closes
+1. **Listen to BOTH the source table AND the tracking table** for change notifications
+2. **Use a deterministic tracking table name** so all tabs can share triggers
+3. **Add BroadcastChannel in TanStack DB** to explicitly notify collections across tabs
